@@ -2,10 +2,17 @@
 // Self-contained mirror of a Showit-hosted site.
 //
 // Pass 1: scan index.html for every //static.showit.co/... and //lib.showit.co/... URL.
-// Pass 2: download each into assets/showit/<preserved-path>. Scan each downloaded
+// Pass 2: parse the inline init_data JSON for every `key` field — the Showit engine
+//         builds image URLs at runtime as `assetURL + "/" + <width-bucket> + "/" + key`
+//         (or `/file/` for svg/gif). Enqueue every key at every size bucket so
+//         sections the static HTML doesn't currently show still have their images.
+// Pass 3: download each into assets/showit/<preserved-path>. Scan each downloaded
 //         .js/.css for further showit.co references; enqueue those too.
-// Pass 3: rewrite URLs in index.html and all downloaded .js/.css to relative
+// Pass 4: rewrite URLs in index.html and all downloaded .js/.css to relative
 //         ./assets/showit/... paths. Leave non-showit URLs alone.
+
+// Size buckets the Showit engine selects from (from I=[...] in showit.min.js).
+const SIZE_BUCKETS = [200, 400, 800, 1200, 1600, 2400, 3200];
 
 import fs from "node:fs/promises";
 import path from "node:path";
@@ -55,15 +62,24 @@ async function download(normUrl) {
       .then(() => true)
       .catch(() => false);
     if (exists) return { normUrl, outPath, skipped: true };
-    const res = await fetch(`https:${normUrl}`, {
-      headers: { "user-agent": USER_AGENT },
-    });
-    if (!res.ok) {
-      return { normUrl, outPath, error: `HTTP ${res.status}` };
+    // Retry transient failures (504s are common on Showit's CDN for
+    // less-frequently-requested size buckets — the origin generates the
+    // resized image on demand and sometimes times out the first request).
+    let lastStatus = null;
+    for (let attempt = 0; attempt < 4; attempt++) {
+      if (attempt > 0) await new Promise((r) => setTimeout(r, 750 * attempt));
+      const res = await fetch(`https:${normUrl}`, {
+        headers: { "user-agent": USER_AGENT },
+      });
+      if (res.ok) {
+        const buf = Buffer.from(await res.arrayBuffer());
+        await fs.writeFile(outPath, buf);
+        return { normUrl, outPath, bytes: buf.length };
+      }
+      lastStatus = res.status;
+      if (res.status < 500 && res.status !== 429) break; // 4xx is permanent
     }
-    const buf = Buffer.from(await res.arrayBuffer());
-    await fs.writeFile(outPath, buf);
-    return { normUrl, outPath, bytes: buf.length };
+    return { normUrl, outPath, error: `HTTP ${lastStatus}` };
   } catch (err) {
     return { normUrl, outPath, error: err.message };
   }
@@ -92,11 +108,58 @@ function extractShowitUrls(text) {
   return [...out];
 }
 
+function extractInitDataKeys(html) {
+  const m = html.match(
+    /<script id="init_data"[^>]*>([\s\S]*?)<\/script>/,
+  );
+  if (!m) return [];
+  let data;
+  try {
+    data = JSON.parse(m[1].trim());
+  } catch {
+    return [];
+  }
+  const keys = new Set();
+  (function walk(v) {
+    if (!v) return;
+    if (Array.isArray(v)) {
+      v.forEach(walk);
+      return;
+    }
+    if (typeof v === "object") {
+      for (const [k, x] of Object.entries(v)) {
+        if (k === "key" && typeof x === "string") keys.add(x);
+        walk(x);
+      }
+    }
+  })(data);
+  return [...keys];
+}
+
+function keyToUrls(key) {
+  // Showit engine: SVG/GIF go under /file/<key>; everything else under
+  // /<size-bucket>/<key>. We don't know which buckets actually exist server-side
+  // for this key, so enqueue every bucket and let download() treat 404 as soft
+  // failure.
+  const ext = key.split(".").pop().toLowerCase();
+  if (["svg", "gif"].includes(ext)) {
+    return [`//static.showit.co/file/${key}`];
+  }
+  return SIZE_BUCKETS.map((w) => `//static.showit.co/${w}/${key}`);
+}
+
 async function main() {
   const html = await fs.readFile(INDEX, "utf8");
-  const initial = extractShowitUrls(html);
-  console.log(`[pass 1] ${initial.length} showit URLs in index.html`);
+  const fromHtml = extractShowitUrls(html);
+  console.log(`[pass 1] ${fromHtml.length} explicit showit URLs in index.html`);
 
+  const keys = extractInitDataKeys(html);
+  const fromKeys = keys.flatMap(keyToUrls);
+  console.log(
+    `[pass 2] ${keys.length} init_data keys -> ${fromKeys.length} candidate URLs across size buckets`,
+  );
+
+  const initial = [...new Set([...fromHtml, ...fromKeys])];
   const discovered = new Set(initial);
   const queue = [...initial];
   const results = [];
@@ -128,10 +191,11 @@ async function main() {
 
   const ok = results.filter((r) => !r.error).length;
   const failed = results.filter((r) => r.error);
+  const hardFails = failed.filter((f) => !/HTTP 404/.test(f.error));
   console.log(
-    `[download] ${ok}/${results.length} assets saved (${failed.length} failed)`,
+    `[download] ${ok}/${results.length} assets saved (${failed.length} missing, ${hardFails.length} hard failures)`,
   );
-  for (const f of failed) console.log(`  FAIL  ${f.normUrl}  -> ${f.error}`);
+  for (const f of hardFails) console.log(`  FAIL  ${f.normUrl}  -> ${f.error}`);
 
   // Rewrite pass — index.html first.
   let rewritten = html;
